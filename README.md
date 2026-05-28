@@ -28,12 +28,12 @@ pip install pygame
 Launch Server:
 
 Bash
-python server.py
+python GOT2.0server.py
 Launch Clients:
 Open a separate terminal for each player and run:
 
 Bash
-python client.py
+python GOT2.0client1.py / GOT2.0client2.py
 ⚙️ How it Works
 Communication: The server listens on a specific port. Clients connect via TCP, sending their movement input (dx, dy) as JSON objects.
 
