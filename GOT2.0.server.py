@@ -125,6 +125,7 @@ def random_floor_tiles(n):
 artifacts       = random_floor_tiles(20)
 game_over       = False
 victory         = False
+game_abandoned  = False  # עדכון: הוספת המשתנה הגלובלי למצב נטישה
 connected       = [None, None]
 connected_count = 0
 players_ready   = set()
@@ -222,7 +223,8 @@ def dragon_ai():
         with lock:
             if connected_count < 2 or len(players_ready) < 1:
                 continue
-            if game_over or victory:
+            # עדכון: אם המשחק ננטש, הדרקון יעצור מיד בדיוק כמו ב-game_over
+            if game_over or victory or game_abandoned:
                 continue
 
             d = dragon
@@ -282,18 +284,21 @@ def dragon_ai():
 
 def handle_client(conn, player_id):
     """
-    Handle all communication with a single connected client.
-    Receives movement input, updates the player's position, checks for
-    artifact collection, and sends the full game state back to the client.
-    Runs in its own thread — one per player.
+    Handles communication and game logic for a single connected client.
 
-    Args:
-        conn      (socket.socket): The client's TCP socket.
-        player_id (int):           The player's ID, either 0 or 1.
+    Concept:
+    This function acts as the "brain" for one player's connection. Since the game is
+    multiplayer, the server runs one instance of this function per player in a
+    separate 'thread' (a parallel task). It constantly listens for inputs from
+    the player, updates the game world based on those inputs, and sends back the
+    'big picture' (where everyone and everything is).
     """
-    global connected_count
+    global connected_count, game_over, game_abandoned
     logging.info(f"Player {player_id} connected.")
 
+    # Networking concept: TCP/IP doesn't guarantee one 'send' equals one 'receive'.
+    # We use a buffer to accumulate incoming bytes until we find a complete
+    # message (denoted by a newline '\n').
     buffer = ""
 
     while True:
@@ -306,33 +311,47 @@ def handle_client(conn, player_id):
             buffer += raw.decode()
 
             while "\n" in buffer:
+                # Extract the first complete JSON message from our accumulated buffer
                 line, buffer = buffer.split("\n", 1)
                 if not line.strip():
                     continue
 
                 data = json.loads(line)
 
+                # The 'lock' ensures thread safety. If both players move at once,
+                # we don't want them overwriting the game state simultaneously
+                # and causing errors (Race Condition).
                 with lock:
-                    if not game_over and not victory:
+                    if not game_over and not victory and not game_abandoned:
                         p = players[player_id]
 
+                        # Player Readiness: Tracking who is on the game screen
+                        # so the server knows when both are ready to start.
                         if data.get("ready"):
                             if player_id not in players_ready:
                                 players_ready.add(player_id)
                                 logging.info(f"Player {player_id} is on the game screen. Ready: {players_ready}")
 
                         if not p["is_dead"]:
+                            # Extract the movement vector sent by the client.
+                            # We default to 0 if the data is missing to ensure stability.
                             dx = data.get("dx", 0)
                             dy = data.get("dy", 0)
                             nx = p["x"] + dx
                             ny = p["y"] + dy
 
-                            # Test X and Y axis movement independently to allow sliding against walls
+                            # Collision Logic: We check X and Y separately.
+                            # This is a classic game dev trick: if you hit a wall
+                            # while moving diagonally, you can still slide along
+                            # it instead of stopping completely.
                             if not is_wall_rect(nx, p["y"], PSIZE, PSIZE):
                                 p["x"] = max(0, min(nx, COLS*TILE - PSIZE))  # Clamp position inside map boundaries
                             if not is_wall_rect(p["x"], ny, PSIZE, PSIZE):
                                 p["y"] = max(0, min(ny, ROWS*TILE - PSIZE))  # Clamp position inside map boundaries
 
+                            # Item Collection Logic: Checking for overlap.
+                            # We use 'absolute difference' (abs) to see if the player
+                            # is close enough to the artifact to 'claim' it.
                             for art in artifacts:
                                 if art["collected"]:
                                     continue
@@ -343,6 +362,9 @@ def handle_client(conn, player_id):
                                     p["score"] += 1
                                     logging.info(f"Player {player_id} collected an artifact! Score: {p['score']}")
 
+                    # State Synchronization: We send the 'whole truth' about the
+                    # game back to the player, so their screen stays in sync
+                    # with the server's master copy of the game.
                     state = {
                         "your_id": player_id,
                         "total_connected": connected_count,
@@ -357,9 +379,12 @@ def handle_client(conn, player_id):
                                        "collected": a["collected"]} for a in artifacts],
                         "game_over": game_over,
                         "victory": victory,
+                        "game_abandoned": game_abandoned,  # עדכון: הוספת השדה לפרוטוקול התקשורת לקליאנט
                         "map": MAP_GRID,
                     }
 
+                # Send the update as a single serialized line to ensure the client
+                # can parse it easily using the same newline-based protocol.
                 conn.sendall((json.dumps(state) + "\n").encode())
 
         except ConnectionResetError:
@@ -372,10 +397,20 @@ def handle_client(conn, player_id):
             logging.error(f"Player {player_id} sent invalid JSON: {e}")
             break
 
+    # Cleanup: Когда цикл прерывается, игрок покинул игру.
     logging.info(f"Player {player_id} disconnected.")
     conn.close()
+
     with lock:
         connected_count -= 1
+
+        # עדכון: הפיכת משתנה הנטישה הגלובלי ל-True.
+        # הקליאנט שיקבל את חבילת המידע יראה ש-game_abandoned הוא True ויוכל להגיב בהתאם.
+        if not game_over and not victory and not game_abandoned:
+            game_abandoned = True
+            players[player_id]["is_dead"] = True
+            logging.info(f"Player {player_id} abandoned the match. Global game_abandoned set to True.")
+
         logging.info(f"Connected count: {connected_count}")
 
 
@@ -390,33 +425,46 @@ def main():
     logging.info(f"Starting GOT Server on {HOST}:{PORT}")
 
     global connected_count
+    # AF_INET = IPv4, SOCK_STREAM = TCP (reliable connection protocol)
     server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    # Allow the OS to immediately reclaim the port upon restart, preventing "Address already in use" errors
+
+    # OS setting: Without this, if you stop and restart the server quickly,
+    # the OS will block the port for a minute. This bypasses that lock.
     server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     server.bind((HOST, PORT))
-    server.listen(2)
+    server.listen(2)  # The server queue: allows up to 2 players to connect
     logging.info(f"Listening on {HOST}:{PORT} — waiting for 2 Knights...")
 
+    # Start the "Brain" of the game: A background task (thread)
+    # that handles the Dragon's AI independently of player connections.
     t_dragon = threading.Thread(target=dragon_ai, daemon=True)
     t_dragon.start()
     logging.info("Dragon AI thread launched.")
 
+    # Connection Loop: The server pauses at 'server.accept()' until someone joins.
+    # We repeat this exactly twice to form our team of 2 players.
     player_id = 0
     while player_id < 2:
-        conn, addr = server.accept()
+        conn, addr = server.accept()  # Pauses here until a client connects
         with lock:
             connected_count += 1
         logging.info(f"Connection from {addr} — assigned as Player {player_id}. Total connected: {connected_count}")
+
+        # Every player gets their own dedicated thread ('handle_client').
+        # This allows the server to talk to Player A and Player B at the exact same time.
         t = threading.Thread(target=handle_client, args=(conn, player_id), daemon=True)
         t.start()
         player_id += 1
 
     logging.info("Both Knights connected. The quest begins!")
 
+    # Keep-Alive: If this main thread finishes, the whole program closes.
+    # This loop keeps the server alive indefinitely while the other threads do the work.
     try:
         while True:
-            time.sleep(1)
+            time.sleep(1)  # Sleep to avoid eating up CPU power unnecessarily
     except KeyboardInterrupt:
+        # Graceful shutdown: triggered when you press Ctrl+C in the console
         logging.info("Shutting down server.")
         server.close()
 
