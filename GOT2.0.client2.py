@@ -25,10 +25,13 @@ import sys
 import math
 import logging
 import pygame
+from collections import deque
 
 # ─── NETWORK CONFIG ───────────────────────────────────────────────────────────
 SERVER_IP   = "127.0.0.1"
 SERVER_PORT = 5555
+# Global state queue: using maxlen prevents memory overflow during long lag spikes
+state_queue = deque(maxlen=100)
 
 # ─── DISPLAY / TILE CONSTANTS ─────────────────────────────────────────────────
 TILE   = 48
@@ -186,45 +189,62 @@ net_lock    = threading.Lock() # Mutex protection layer for incoming server stat
 send_queue  = []               # Atomic collection arrays storing delta inputs waiting transmission
 send_lock   = threading.Lock() # Mutex protection layer managing out-bound payload serialization
 
+
+def recv_exact(sock, num_bytes):
+    """
+    Helper function that ensures reading the exact requested number of bytes
+    from the TCP stream. This prevents issues where only a partial message
+    is received due to network fragmentation.
+    """
+    data = bytearray()
+    while len(data) < num_bytes:
+        packet = sock.recv(num_bytes - len(data))
+        if not packet:
+            return None  # Connection closed by the server
+        data.extend(packet)
+    return bytes(data)
+
+
 def network_thread(sock):
     """
-    Background thread that handles all network communication.
-    Sends queued movement packets to the server and receives
-    the latest game state, updating net_state on every frame.
-
-    Args:
-        sock (socket.socket): The connected TCP socket.
+    Background thread that handles network communication.
+    Uses a 4-byte length prefix (Header) for reliable framing and
+    a queue to prevent state loss during CPU lag.
     """
-    buf = ""
     while True:
         try:
             # --- Pipeline 1: Outbound Serializer ---
-            # Shallow-copy and purge local queues instantaneously under lock scope
-            # to minimize main-thread execution delays inside key updates.
             with send_lock:
                 packets = send_queue[:]
                 send_queue.clear()
-            for pkt in packets:
-                sock.sendall((json.dumps(pkt) + "\n").encode())
 
-            # Maintain socket heartbeat and keep-alive sequence if no intentional physics
-            # input vectors were populated on this specific loop frame.
             if not packets:
-                sock.sendall((json.dumps({"dx": 0, "dy": 0}) + "\n").encode())
+                packets.append({"dx": 0, "dy": 0})
 
-            # --- Pipeline 2: Inbound TCP Stream Deframer ---
-            # Standard streaming sockets do not guarantee packet boundaries.
-            # We buffer raw byte pieces and reconstruct them using clean newline delimiters.
-            data = sock.recv(8192).decode()
-            buf += data
-            while "\n" in buf:
-                line, buf = buf.split("\n", 1)
-                if line.strip():
-                    parsed = json.loads(line)
-                    # Safely swap variables into the main thread container using mutex protection.
-                    with net_lock:
-                        net_state.clear()
-                        net_state.update(parsed)
+            for pkt in packets:
+                payload = json.dumps(pkt).encode('utf-8')
+                header = len(payload).to_bytes(4, byteorder='big')
+                sock.sendall(header + payload)
+
+            # --- Pipeline 2: Inbound Deframer ---
+            # 1. Read Header
+            header_data = recv_exact(sock, 4)
+            if not header_data:
+                break
+
+            msg_length = int.from_bytes(header_data, byteorder='big')
+
+            # 2. Read Payload
+            payload_data = recv_exact(sock, msg_length)
+            if not payload_data:
+                break
+
+            parsed = json.loads(payload_data.decode('utf-8'))
+
+            # 3. Queue update instead of overwriting
+            with net_lock:
+                state_queue.append(parsed)
+
         except Exception as e:
             logging.error(f"Network thread error: {e}")
             break
@@ -488,8 +508,22 @@ def main():
         # ── Get latest network state ──────────────────────────────────────
         # Isolate the thread extraction sequence via critical-section mutex.
         # Making a shallow copy prevents data mutation mid-render frame.
+        current_snap = None
+
         with net_lock:
-            snap = dict(net_state)
+            # Drain the queue entirely to reach the most recent game state
+            while state_queue:
+                current_snap = state_queue.popleft()
+                # Store the most recently processed state to maintain continuity
+                last_known_snap = current_snap
+
+                # If a new state was retrieved from the queue, use it;
+        # otherwise, fall back to the last known state to avoid rendering errors.
+        if current_snap:
+            snap = current_snap
+        else:
+            snap = last_known_snap if 'last_known_snap' in locals() else None
+
 
         if snap:
             # Capture individual identity index distributed uniquely via the server setup message
