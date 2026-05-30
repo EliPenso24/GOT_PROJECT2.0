@@ -282,110 +282,107 @@ def dragon_ai():
 
 # ─── CLIENT HANDLER ───────────────────────────────────────────────────────────
 
+def recv_exact(sock, num_bytes):
+    """
+    Helper function to ensure exact byte reading from the TCP stream.
+    """
+    data = bytearray()
+    while len(data) < num_bytes:
+        packet = sock.recv(num_bytes - len(data))
+        if not packet:
+            return None
+        data.extend(packet)
+    return bytes(data)
+
+
 def handle_client(conn, player_id):
     """
     Handles communication and game logic for a single connected client.
-
-    Concept:
-    This function acts as the "brain" for one player's connection. Since the game is
-    multiplayer, the server runs one instance of this function per player in a
-    separate 'thread' (a parallel task). It constantly listens for inputs from
-    the player, updates the game world based on those inputs, and sends back the
-    'big picture' (where everyone and everything is).
+    Updated to use 4-byte length prefix protocol.
     """
     global connected_count, game_over, game_abandoned
     logging.info(f"Player {player_id} connected.")
 
-    # Networking concept: TCP/IP doesn't guarantee one 'send' equals one 'receive'.
-    # We use a buffer to accumulate incoming bytes until we find a complete
-    # message (denoted by a newline '\n').
-    buffer = ""
-
     while True:
         try:
-            raw = conn.recv(4096)
-            if not raw:
+            # --- 1. Inbound Deframer (Receive Data) ---
+
+            # Read exactly 4 bytes for the Header
+            header_data = recv_exact(conn, 4)
+            if not header_data:
                 logging.warning(f"Player {player_id} sent empty data — disconnecting.")
                 break
 
-            buffer += raw.decode()
+            # Decode the length from the 4-byte Header
+            msg_length = int.from_bytes(header_data, byteorder='big')
 
-            while "\n" in buffer:
-                # Extract the first complete JSON message from our accumulated buffer
-                line, buffer = buffer.split("\n", 1)
-                if not line.strip():
-                    continue
+            # Read the exact payload based on the length we just received
+            payload_data = recv_exact(conn, msg_length)
+            if not payload_data:
+                logging.warning(f"Player {player_id} payload incomplete — disconnecting.")
+                break
 
-                data = json.loads(line)
+            # Parse the JSON data
+            data = json.loads(payload_data.decode('utf-8'))
 
-                # The 'lock' ensures thread safety. If both players move at once,
-                # we don't want them overwriting the game state simultaneously
-                # and causing errors (Race Condition).
-                with lock:
-                    if not game_over and not victory and not game_abandoned:
-                        p = players[player_id]
+            # --- 2. Game Logic (Shared State Update) ---
+            with lock:
+                if not game_over and not victory and not game_abandoned:
+                    p = players[player_id]
 
-                        # Player Readiness: Tracking who is on the game screen
-                        # so the server knows when both are ready to start.
-                        if data.get("ready"):
-                            if player_id not in players_ready:
-                                players_ready.add(player_id)
-                                logging.info(f"Player {player_id} is on the game screen. Ready: {players_ready}")
+                    if data.get("ready"):
+                        if player_id not in players_ready:
+                            players_ready.add(player_id)
+                            logging.info(f"Player {player_id} is on the game screen. Ready: {players_ready}")
 
-                        if not p["is_dead"]:
-                            # Extract the movement vector sent by the client.
-                            # We default to 0 if the data is missing to ensure stability.
-                            dx = data.get("dx", 0)
-                            dy = data.get("dy", 0)
-                            nx = p["x"] + dx
-                            ny = p["y"] + dy
+                    if not p["is_dead"]:
+                        dx = data.get("dx", 0)
+                        dy = data.get("dy", 0)
+                        nx = p["x"] + dx
+                        ny = p["y"] + dy
 
-                            # Collision Logic: We check X and Y separately.
-                            # This is a classic game dev trick: if you hit a wall
-                            # while moving diagonally, you can still slide along
-                            # it instead of stopping completely.
-                            if not is_wall_rect(nx, p["y"], PSIZE, PSIZE):
-                                p["x"] = max(0, min(nx, COLS*TILE - PSIZE))  # Clamp position inside map boundaries
-                            if not is_wall_rect(p["x"], ny, PSIZE, PSIZE):
-                                p["y"] = max(0, min(ny, ROWS*TILE - PSIZE))  # Clamp position inside map boundaries
+                        if not is_wall_rect(nx, p["y"], PSIZE, PSIZE):
+                            p["x"] = max(0, min(nx, COLS * TILE - PSIZE))
+                        if not is_wall_rect(p["x"], ny, PSIZE, PSIZE):
+                            p["y"] = max(0, min(ny, ROWS * TILE - PSIZE))
 
-                            # Item Collection Logic: Checking for overlap.
-                            # We use 'absolute difference' (abs) to see if the player
-                            # is close enough to the artifact to 'claim' it.
-                            for art in artifacts:
-                                if art["collected"]:
-                                    continue
-                                # Center-based bounding box overlap check for collecting items
-                                if (abs(p["x"] - art["x"]) < PSIZE and
-                                        abs(p["y"] - art["y"]) < PSIZE):
-                                    art["collected"] = True
-                                    p["score"] += 1
-                                    logging.info(f"Player {player_id} collected an artifact! Score: {p['score']}")
+                        for art in artifacts:
+                            if art["collected"]:
+                                continue
+                            if (abs(p["x"] - art["x"]) < PSIZE and
+                                    abs(p["y"] - art["y"]) < PSIZE):
+                                art["collected"] = True
+                                p["score"] += 1
+                                logging.info(f"Player {player_id} collected an artifact! Score: {p['score']}")
 
-                    # State Synchronization: We send the 'whole truth' about the
-                    # game back to the player, so their screen stays in sync
-                    # with the server's master copy of the game.
-                    state = {
-                        "your_id": player_id,
-                        "total_connected": connected_count,
-                        "players": {str(i): {
-                            "x": players[i]["x"],
-                            "y": players[i]["y"],
-                            "score": players[i]["score"],
-                            "is_dead": players[i]["is_dead"],
-                        } for i in (0, 1)},
-                        "dragon": {"x": dragon["x"], "y": dragon["y"]},
-                        "artifacts": [{"x": a["x"], "y": a["y"],
-                                       "collected": a["collected"]} for a in artifacts],
-                        "game_over": game_over,
-                        "victory": victory,
-                        "game_abandoned": game_abandoned,  # עדכון: הוספת השדה לפרוטוקול התקשורת לקליאנט
-                        "map": MAP_GRID,
-                    }
+                state = {
+                    "your_id": player_id,
+                    "total_connected": connected_count,
+                    "players": {str(i): {
+                        "x": players[i]["x"],
+                        "y": players[i]["y"],
+                        "score": players[i]["score"],
+                        "is_dead": players[i]["is_dead"],
+                    } for i in (0, 1)},
+                    "dragon": {"x": dragon["x"], "y": dragon["y"]},
+                    "artifacts": [{"x": a["x"], "y": a["y"],
+                                   "collected": a["collected"]} for a in artifacts],
+                    "game_over": game_over,
+                    "victory": victory,
+                    "game_abandoned": game_abandoned,
+                    "map": MAP_GRID,
+                }
 
-                # Send the update as a single serialized line to ensure the client
-                # can parse it easily using the same newline-based protocol.
-                conn.sendall((json.dumps(state) + "\n").encode())
+            # --- 3. Outbound Serializer (Send Data) ---
+
+            # Encode JSON to bytes
+            payload_out = json.dumps(state).encode('utf-8')
+
+            # Calculate length and pack into a 4-byte header
+            header_out = len(payload_out).to_bytes(4, byteorder='big')
+
+            # Send Header followed immediately by the payload
+            conn.sendall(header_out + payload_out)
 
         except ConnectionResetError:
             logging.warning(f"Player {player_id} connection reset.")
@@ -393,19 +390,16 @@ def handle_client(conn, player_id):
         except BrokenPipeError:
             logging.warning(f"Player {player_id} connection broken.")
             break
-        except json.JSONDecodeError as e:
-            logging.error(f"Player {player_id} sent invalid JSON: {e}")
+        except Exception as e:
+            logging.error(f"Player {player_id} network or JSON error: {e}")
             break
 
-    # Cleanup: Когда цикл прерывается, игрок покинул игру.
+    # Cleanup: When the loop breaks, the player has left.
     logging.info(f"Player {player_id} disconnected.")
     conn.close()
 
     with lock:
         connected_count -= 1
-
-        # עדכון: הפיכת משתנה הנטישה הגלובלי ל-True.
-        # הקליאנט שיקבל את חבילת המידע יראה ש-game_abandoned הוא True ויוכל להגיב בהתאם.
         if not game_over and not victory and not game_abandoned:
             game_abandoned = True
             players[player_id]["is_dead"] = True
